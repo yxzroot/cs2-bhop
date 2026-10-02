@@ -1,0 +1,122 @@
+# =============================================================================
+#  Velocity — .gitignore
+# =============================================================================
+
+# --- Python bytecode ---------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# --- Virtual environments ----------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+.python-version
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- Packaging / build artifacts --------------------------------------------
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+wheels/
+.installed.cfg
+
+# --- PyInstaller -------------------------------------------------------------
+# The spec file itself stays tracked (velocity.spec), but its outputs don't.
+*.manifest
+*.spec.bak
+# Uncomment the next line if you don't want the spec in version control either:
+# *.spec
+
+# --- Compiled C++ / CS2 helper ----------------------------------------------
+cs2_bhop.exe
+cs2_bhop.obj
+cs2_bhop.pdb
+cs2_bhop.ilk
+cs2_bhop.exp
+cs2_bhop.lib
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+.cs2_bhop.exe.new
+
+# --- Auto-updater runtime state ---------------------------------------------
+# Everything the updater generates at runtime — never commit any of this.
+updates/
+offsets_cache/
+dependencies/
+update_cache/
+apply_update.log
+apply_update.bat
+build.log
+manifest.log
+
+# --- User data (per-install, never shared) ----------------------------------
+bhop_settings.json
+bhop_settings.json.tmp
+bunnyhop logs/
+logs/
+*.log
+session_*.log
+
+# --- Editor backups of source files -----------------------------------------
+# The updater writes one .bak per file it rewrites; those are local-only.
+*.bak
+*.orig
+*.rej
+*~
+
+# --- IDE / editor ------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+.tags
+cscope.*
+*~
+
+# --- OS junk ----------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# --- Windows ----------------------------------------------------------------
+$RECYCLE.BIN/
+*.lnk
+*.stackdump
+
+# =============================================================================
+#  Explicitly TRACKED (do not ignore — listed for clarity):
+#
+#    LICENSE
+#    README.md
+#    requirements.txt
+#    build_config.py
+#    bhop_core.py
+#    cs2_bhop.py
+#    cs2_bhop.cpp
+#    cs2_bhop.bat
+#    start.bat
+#    themes.py
+#    updater.py
+#    velocity.spec
+#    generate_hello_kitty_background.py
+#    hello_kitty_background.png
+#
+# =============================================================================

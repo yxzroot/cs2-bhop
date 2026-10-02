@@ -1,0 +1,11 @@
+# Velocity — runtime dependencies
+#
+# The GUI's first-run setup flow already fetches and SHA-256-verifies the
+# pymem wheel into <data_directory>/dependencies/pymem-<version>/. Listing
+# it here as well keeps `pip install -r requirements.txt` a complete
+# bootstrap for fresh machines, CI, and the post-update refresh step.
+pymem==1.14.0
+
+# --- build-time only (commented out; install manually when freezing) ---
+# pyinstaller>=6.0
+# pillow>=10.0        # only if you re-encode theme wallpapers at build time

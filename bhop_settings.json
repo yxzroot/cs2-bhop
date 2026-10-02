@@ -1,0 +1,10 @@
+{
+  "auto_check_updates": true,
+  "auto_download_updates": true,
+  "debug_mode": false,
+  "enabled": true,
+  "exit_key": 35,
+  "preset": "Default",
+  "theme": "Dark",
+  "toggle_key": 45
+}

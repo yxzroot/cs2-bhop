@@ -50,11 +50,11 @@ namespace offsets
     // ----- client.dll offsets -----
     // Pointer to the local player's C_CSPlayerPawn*.
     // Found in client.dll via pattern scan or offset dump.
-    constexpr std::ptrdiff_t dwLocalPlayerPawn = 0x2560698;   // UPDATE ME
+    constexpr std::ptrdiff_t dwLocalPlayerPawn = 0x1880E48;   // UPDATE ME
 
     // ----- C_BaseEntity / C_CSPlayerPawn field offsets -----
     // m_fFlags — bitmask containing FL_ONGROUND (bit 0).
-    constexpr std::ptrdiff_t m_fFlags = 0x3F4;                // UPDATE ME
+    constexpr std::ptrdiff_t m_fFlags = 0x3EC;                // UPDATE ME
 
     // (Optional) Additional offsets you might need for more advanced features:
     // constexpr std::ptrdiff_t m_vecVelocity   = 0x???;

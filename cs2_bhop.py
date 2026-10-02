@@ -30,7 +30,7 @@ from bhop_core import (
     SettingsStore,
 )
 from themes import THEME_NAMES, ThemeManager
-from updater import NewsItem, StableRelease, UpdateError, UpdateManager
+from updater import NewsItem, OffsetFetcher, StableRelease, UpdateError, UpdateManager
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 kernel32.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
@@ -441,6 +441,8 @@ class BhopApp(tk.Tk):
         self._apply_palette()
         executable = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve()
         self.updater = UpdateManager(APP_VERSION, self.data_directory, executable)
+        self.offset_fetcher = OffsetFetcher(self.data_directory)
+        self.offsets_thread = None
         self.update_info: StableRelease | None = None
         self.update_downloaded = None
         self.update_thread = None
@@ -1594,6 +1596,9 @@ class BhopApp(tk.Tk):
         tk.Checkbutton(update_options, text="Download stable updates", variable=self.auto_download_var, command=self._toggle_auto_download, bg=self.PANEL, fg=self.TEXT, selectcolor=self.INPUT, activebackground=self.PANEL, activeforeground=self.TEXT, font=("Segoe UI", 8), relief="flat", highlightthickness=0).pack(anchor="w", pady=(3, 0))
         self.update_button = RoundedButton(update_controls, "Check for Updates", self._update_action, self.BUTTON, self.TEXT, width=140, height=32)
         self.update_button.pack(side="right")
+        self.offsets_button = RoundedButton(update_controls, "Refresh Offsets", self._refresh_offsets, self.BUTTON, self.TEXT, width=140, height=32)
+        self.offsets_button.pack(side="right", padx=(0, 8))
+        ToolTip(self.offsets_button, "Pull the latest CS2 offsets from sezzyaep/CS2-OFFSETS and rebuild the C++ helper.")
 
         channel = RoundedPanel(row, self.PANEL, height=246, radius=18, inset=20)
         channel.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
@@ -1872,6 +1877,93 @@ class BhopApp(tk.Tk):
             self._download_update()
         else:
             self._check_for_updates()
+
+    def _refresh_offsets(self):
+        """Fetch fresh offsets from sezzyaep/CS2-OFFSETS, rewrite both source
+        files, then rebuild the C++ helper — all on a worker thread so the UI
+        stays responsive during the network round-trip and the compile."""
+        if self.offsets_thread and self.offsets_thread.is_alive():
+            return
+
+        project_root = (
+            self.executable.parent if getattr(sys, "frozen", False)
+            else Path(__file__).resolve().parent
+        )
+
+        self.offsets_button.set_enabled(False)
+        self.offsets_button.set_text("Fetching…")
+        self.update_status_label.configure(
+            text="●  Fetching live offsets from sezzyaep/CS2-OFFSETS…",
+            fg=self.MUTED,
+        )
+        self._log("Fetching live offsets from sezzyaep/CS2-OFFSETS…")
+
+        self.offsets_thread = threading.Thread(
+            target=self._refresh_offsets_worker,
+            args=(project_root,),
+            name="VelocityOffsets",
+            daemon=True,
+        )
+        self.offsets_thread.start()
+
+    def _refresh_offsets_worker(self, project_root):
+        error = None
+        report = None
+        build = None
+        try:
+            report = self.offset_fetcher.refresh_project(project_root, force=True)
+            if report.ok:
+                build = self.updater.rebuild_cpp(project_root, log_sink=self._log)
+        except Exception as exc:
+            error = str(exc)
+        try:
+            self.after(0, self._finish_refresh_offsets, report, build, error)
+        except tk.TclError:
+            pass
+
+    def _finish_refresh_offsets(self, report, build, error):
+        self.offsets_button.set_enabled(True)
+        self.offsets_button.set_text("Refresh Offsets")
+
+        if error:
+            self.update_status_label.configure(
+                text="●  Offset refresh failed — see Activity", fg=self.DANGER,
+            )
+            self._log(f"Offset refresh failed: {error}")
+            return
+
+        if report is None or not report.ok:
+            detail = "; ".join(report.errors) if report else "no report returned"
+            self.update_status_label.configure(
+                text="●  Offset refresh failed — see Activity", fg=self.DANGER,
+            )
+            self._log(f"Offset refresh failed: {detail}")
+            return
+
+        for err in report.errors:
+            self._log(f"  offset error: {err}")
+        self._log(report.summary())
+
+        if build is not None:
+            self._log(f"C++ rebuild: {build.summary()}")
+            if not build.ok:
+                for err in build.errors:
+                    self._log(f"  build error: {err}")
+
+        if build is not None and build.ok:
+            self.update_status_label.configure(
+                text=f"●  {report.summary()} — {build.summary()}",
+                fg=self.GREEN,
+            )
+        elif build is not None:
+            self.update_status_label.configure(
+                text=f"●  Offsets applied, but {build.summary()}",
+                fg=self.WARNING,
+            )
+        else:
+            self.update_status_label.configure(
+                text=f"●  {report.summary()}", fg=self.GREEN,
+            )
 
     def _toggle_auto_check(self):
         enabled = bool(self.auto_check_var.get())
