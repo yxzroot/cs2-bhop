@@ -17,20 +17,23 @@ import zipfile
 from ctypes import wintypes
 from pathlib import Path
 
-from bhop_core import (
+from build_config import (
     APP_DISPLAY_VERSION,
     APP_NAME,
     APP_VERSION,
     BUILD_CHANNEL,
     BUILD_FLAVOR,
     BUILD_TYPE,
+)
+from bhop_core import (
     CHANGELOG,
     BhopWorker,
     PRESETS,
     SettingsStore,
 )
-from themes import THEME_NAMES, ThemeManager
-from updater import NewsItem, StableRelease, UpdateError, UpdateManager
+from crash_reporter import install_crash_reporter
+from themes import THEME_NAMES, THEMES, ThemeManager
+from updater import StableRelease, UpdateManager
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 kernel32.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
@@ -40,8 +43,11 @@ kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
 kernel32.CloseHandle.restype = ctypes.c_bool
 kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 
-SINGLE_INSTANCE_MUTEX = "Local\\VelocityV2SingleInstance"
-MENU_TOGGLE_KEY = 0x74  # VK_F5 — fixed overlay toggle, separate from BHOP keybinds.
+SINGLE_INSTANCE_MUTEX = "Local\\DragiWareV2SingleInstance"
+MOD_ALT = 0x1
+MOD_CONTROL = 0x2
+MOD_SHIFT = 0x4
+MOD_WIN = 0x8
 WM_HOTKEY = 0x0312
 PM_REMOVE = 0x0001
 PYMEM_VERSION = "1.14.0"
@@ -134,6 +140,43 @@ class RoundedPanel(tk.Canvas):
             self.configure(height=required_height)
 
 
+class ThemeCard(tk.Canvas):
+    """Palette-driven card used by the Themes page."""
+    def __init__(self, parent, name, palette, selected, command):
+        super().__init__(parent, bg=parent["bg"], height=154, bd=0, highlightthickness=0, cursor="hand2")
+        self.name, self.palette, self.selected, self.command = name, palette, selected, command
+        self.hovered = False
+        self.body = tk.Frame(self, bg=palette["panel"])
+        self.window = self.create_window(12, 12, anchor="nw", window=self.body)
+        self.bind("<Configure>", self._resize)
+        self.bind("<Enter>", lambda _event: self._set_hover(True))
+        self.bind("<Leave>", lambda _event: self._set_hover(False))
+        self.bind("<Button-1>", self._click)
+        self._draw()
+
+    def _draw(self):
+        self.delete("card")
+        width, height = max(self.winfo_width(), 2), max(self.winfo_height(), 2)
+        fill = self.palette["alt"] if self.hovered or self.selected else self.palette["panel"]
+        outline = self.palette["accent"] if self.selected else self.palette["line"]
+        rounded_rectangle(self, 1, 1, width - 1, height - 1, 16, fill=fill, outline="", tags="card")
+        self.configure(highlightthickness=2 if self.selected else 0, highlightbackground=outline)
+        self.tag_lower("card")
+
+    def _resize(self, _event=None):
+        width = max(self.winfo_width() - 24, 1)
+        self.itemconfigure(self.window, width=width)
+        self.coords(self.window, 12, 12)
+        self._draw()
+
+    def _set_hover(self, hovered):
+        self.hovered = hovered
+        self._draw()
+
+    def _click(self, _event=None):
+        self.command(self.name)
+
+
 class ScrollArea(tk.Frame):
     """Keeps a page reachable in a smaller window instead of clipping controls."""
     def __init__(self, parent, bg):
@@ -146,6 +189,7 @@ class ScrollArea(tk.Frame):
         self.canvas.bind("<Configure>", self._stretch)
         self.canvas.bind("<Enter>", lambda _event: self.canvas.bind_all("<MouseWheel>", self._wheel))
         self.canvas.bind("<Leave>", lambda _event: self.canvas.unbind_all("<MouseWheel>"))
+        self.bind("<Destroy>", lambda _event: self.canvas.unbind_all("<MouseWheel>"))
 
     def _sync_scroll(self, _event=None):
         self.canvas.configure(scrollregion=self.canvas.bbox("all") or (0, 0, 0, 0))
@@ -154,9 +198,12 @@ class ScrollArea(tk.Frame):
         self.canvas.itemconfigure(self._window, width=event.width)
 
     def _wheel(self, event):
-        if self.canvas.winfo_height() >= self.body.winfo_reqheight():
-            return
-        self.canvas.yview_scroll(int(-event.delta / 120), "units")
+        try:
+            if not self.canvas.winfo_exists() or self.canvas.winfo_height() >= self.body.winfo_reqheight():
+                return
+            self.canvas.yview_scroll(int(-event.delta / 120), "units")
+        except tk.TclError:
+            self.canvas.unbind_all("<MouseWheel>")
 
 
 class RoundedButton(tk.Canvas):
@@ -392,7 +439,7 @@ class BhopApp(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("Velocity — Bhop Control System")
+        self.title("DragiWare — Bhop Control System")
         self.overrideredirect(True)
         # The cards contain real controls, so give the overlay enough width for
         # their copy and actions to breathe instead of forcing them together.
@@ -411,6 +458,7 @@ class BhopApp(tk.Tk):
         self.hotkey_thread_id = None
         self.hotkey_stop = threading.Event()
         self.hotkey_ready = threading.Event()
+        self.local_hotkey_bound = False
         self.menu_events = queue.Queue()
         self.drag_origin = None
         self.fade_after_id = None
@@ -437,17 +485,22 @@ class BhopApp(tk.Tk):
         self.log_directory = self.data_directory / "bunnyhop logs"
         self.log_directory.mkdir(parents=True, exist_ok=True)
         self.settings = SettingsStore(self.data_directory / "bhop_settings.json")
+        initial_settings = self.settings.snapshot()
+        self.menu_toggle_key = initial_settings["menu_toggle_key"]
+        self.menu_toggle_modifiers = initial_settings["menu_toggle_modifiers"]
         self.theme_manager = ThemeManager(self.settings.snapshot().get("theme", "Dark"))
         self._apply_palette()
+        self._theme_animation_id = None
+        self._theme_finish_id = None
+        self._theme_transition_generation = 0
+        self._display_palette = self.theme_manager.palette
         executable = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve()
         self.updater = UpdateManager(APP_VERSION, self.data_directory, executable)
         self.update_info: StableRelease | None = None
         self.update_downloaded = None
         self.update_thread = None
         self.update_check_running = False
-        self.news_thread = None
-        self.news_check_running = False
-        self.news_items: list[NewsItem] = []
+        self.update_dialog = None
         self.wallpaper_canvas = None
         self.wallpaper_source = None
         self.wallpaper_image = None
@@ -463,9 +516,14 @@ class BhopApp(tk.Tk):
         self._sync_settings_to_ui()
         self._log(f"Settings loaded: {self.settings.path.name} ({values['preset']} preset).")
         self.bind_all("<KeyPress>", self._capture_keybind)
+        self.bind_all("<ButtonPress>", self._ignore_mouse_key_capture)
         self.after(80, self._consume_events)
         self.after(30, self._poll_menu_hotkey)
         self._start_startup_animation(values)
+
+    def _ignore_mouse_key_capture(self, _event):
+        if self.capturing_keybind == "menu":
+            return "break"
 
     def _boot_after(self, delay, callback, *args):
         """Schedule a boot callback without blocking Tk's event loop."""
@@ -506,7 +564,7 @@ class BhopApp(tk.Tk):
 
         header = tk.Frame(terminal, bg=self.PANEL)
         header.grid(row=0, column=0, sticky="ew", padx=28, pady=(24, 0))
-        tk.Label(header, text="VELOCITY  /  SYSTEM BOOT", bg=self.PANEL, fg=self.RED, font=("Cascadia Mono", 9)).pack(side="left")
+        tk.Label(header, text="DRAGIWARE  /  SYSTEM BOOT", bg=self.PANEL, fg=self.RED, font=("Cascadia Mono", 9)).pack(side="left")
         tk.Label(header, text=f"{BUILD_CHANNEL.upper()}  /  {BUILD_TYPE.upper()}", bg=self.PANEL, fg=self.SUBTLE, font=("Cascadia Mono", 8)).pack(side="right")
         tk.Frame(terminal, bg=self.LINE, height=1).grid(row=1, column=0, sticky="ew", padx=28, pady=(16, 0))
 
@@ -533,7 +591,7 @@ class BhopApp(tk.Tk):
         self.startup_log.tag_configure("accent", foreground=self.RED)
         self.startup_log.tag_configure("ok", foreground=self.GREEN)
         self.startup_log.tag_configure("deferred", foreground=self.WARNING)
-        self.startup_log.insert("end", "VELOCITY BOOT SEQUENCE\n\n", "heading")
+        self.startup_log.insert("end", "DRAGIWARE BOOT SEQUENCE\n\n", "heading")
 
         footer = tk.Frame(terminal, bg=self.PANEL)
         footer.grid(row=3, column=0, sticky="ew", padx=28, pady=(16, 24))
@@ -554,7 +612,7 @@ class BhopApp(tk.Tk):
         self.startup_cursor.pack(side="right")
 
         self._boot_lines = (
-            "> initializing velocity core...",
+            "> initializing dragiware core...",
             "> loading configuration...",
             "> scanning local assets...",
             "> initializing theme engine...",
@@ -613,7 +671,7 @@ class BhopApp(tk.Tk):
         core_ready = bool(getattr(self, "settings", None)) and bool(getattr(self, "session_log", None))
         services_ready = self.dependencies_ready and bool(getattr(self, "updater", None))
         return (
-            ("velocity core", "OK" if core_ready else "DEFERRED", "ok" if core_ready else "deferred"),
+            ("dragiware core", "OK" if core_ready else "DEFERRED", "ok" if core_ready else "deferred"),
             ("theme engine", "OK" if palette_ready else "DEFERRED", "ok" if palette_ready else "deferred"),
             ("interface", "OK" if interface_ready else "DEFERRED", "ok" if interface_ready else "deferred"),
             ("services", "OK" if services_ready else "DEFERRED", "ok" if services_ready else "deferred"),
@@ -654,8 +712,8 @@ class BhopApp(tk.Tk):
             self._boot_after(delay, self._boot_progress_step, self._boot_progress_value)
         else:
             self.startup_log.insert("end", "\nSYSTEM READY\n\n", "heading")
-            self.startup_log.insert("end", "        V E L O C I T Y\n\n", "accent")
-            self.startup_log.insert("end", "Welcome back, user.\n", "heading")
+            self.startup_log.insert("end", "        D R A G I W A R E\n\n", "accent")
+            self.startup_log.insert("end", "Ready.\n", "heading")
             self.startup_log.see("end")
             self.startup_status.configure(text="welcome back, user.")
             self._boot_after(850, self._finish_startup_animation)
@@ -678,13 +736,12 @@ class BhopApp(tk.Tk):
             self.after(140, self._show_setup)
         if values.get("auto_check_updates", True):
             self.after(900, self._startup_update_check)
-        self.after(1200, self._startup_news_check)
 
     @staticmethod
     def _resolve_data_directory():
         if getattr(sys, "frozen", False):
             appdata = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
-            return appdata / "Velocity"
+            return appdata / "DragiWare"
         return Path(__file__).resolve().parent
 
     def _user_dependency_directory(self):
@@ -705,10 +762,10 @@ class BhopApp(tk.Tk):
         except (ImportError, ModuleNotFoundError, ValueError):
             return False
 
-    def _apply_palette(self, name=None):
+    def _apply_palette(self, name=None, palette=None):
         if name:
             self.theme_manager.select(name)
-        palette = self.theme_manager.palette
+        palette = palette or self.theme_manager.palette
         aliases = {
             "BG": "bg", "SIDEBAR": "sidebar", "PANEL": "panel", "ALT": "alt",
             "TEXT": "text", "MUTED": "muted", "SUBTLE": "subtle", "LINE": "line",
@@ -725,6 +782,118 @@ class BhopApp(tk.Tk):
         self.ACCENT = self.RED
         self.BACKGROUND = palette.get("background")
         self.theme_name = self.theme_manager.name
+
+    @staticmethod
+    def _blend_theme_color(start, end, progress):
+        if not (isinstance(start, str) and isinstance(end, str) and start.startswith("#") and end.startswith("#")):
+            return end if progress >= 1 else start
+        try:
+            channels = [
+                round(int(start[index:index + 2], 16) + (int(end[index:index + 2], 16) - int(start[index:index + 2], 16)) * progress)
+                for index in (1, 3, 5)
+            ]
+            return "#%02x%02x%02x" % tuple(channels)
+        except (TypeError, ValueError):
+            return end if progress >= 1 else start
+
+    def _interpolated_palette(self, start, end, progress):
+        return {key: self._blend_theme_color(start.get(key), end.get(key), progress) for key in end}
+
+    def _update_theme_widgets(self, old_palette, palette):
+        color_map = {old_palette[key]: palette[key] for key in palette if key in old_palette}
+
+        def update(widget):
+            if isinstance(widget, RoundedPanel):
+                widget.color = palette.get("panel", widget.color)
+                widget.body.configure(bg=widget.color)
+                widget._resize()
+            elif isinstance(widget, RoundedButton):
+                for attribute in ("fill", "foreground", "hover_fill", "pressed_fill"):
+                    value = getattr(widget, attribute, None)
+                    if value in color_map:
+                        setattr(widget, attribute, color_map[value])
+                widget._draw()
+            elif isinstance(widget, ToggleSwitch):
+                for attribute in ("track_on", "track_off", "hover_on", "hover_off", "thumb", "disabled"):
+                    value = getattr(widget, attribute, None)
+                    if value in color_map:
+                        setattr(widget, attribute, color_map[value])
+                widget._draw()
+            if isinstance(widget, ThemeCard):
+                widget.palette = palette if widget.name == self._transition_target else THEMES.get(widget.name, widget.palette)
+                widget.body.configure(bg=widget.palette.get("alt", widget.palette["panel"]))
+                widget._draw()
+            for option in ("bg", "fg", "activebackground", "activeforeground", "highlightbackground", "insertbackground"):
+                try:
+                    value = widget.cget(option)
+                    value = str(value)
+                    if value in color_map:
+                        widget.configure(**{option: color_map[value]})
+                except (tk.TclError, KeyError, TypeError, ValueError):
+                    pass
+            for child in widget.winfo_children():
+                update(child)
+
+        update(self)
+
+    def _animate_theme(self, start, target_name, target, start_time, generation):
+        if self.closing or generation != self._theme_transition_generation:
+            return
+        try:
+            elapsed = time.perf_counter() - start_time
+            progress = min(1.0, elapsed / 0.28)
+            eased = 1 - (1 - progress) ** 3
+            previous = self._display_palette
+            palette = self._interpolated_palette(start, target, eased)
+            self._display_palette = palette
+            self._apply_palette(palette=palette)
+            self._update_theme_widgets(previous, palette)
+            for canvas in getattr(self, "_theme_preview_canvases", ()):
+                if canvas.winfo_exists():
+                    self._draw_theme_preview(canvas)
+            if hasattr(self, "themes_page"):
+                self.themes_page.update_idletasks()
+            if progress < 1.0:
+                self._theme_animation_id = self.after(16, self._animate_theme, start, target_name, target, start_time, generation)
+                return
+            self._theme_animation_id = None
+            self.theme_manager.select(target_name)
+            self._apply_palette()
+            self._display_palette = self.theme_manager.palette
+            self._theme_finish_id = self.after_idle(self._finish_theme_transition, target_name, generation)
+        except (tk.TclError, TypeError, ValueError, RuntimeError) as error:
+            if generation != self._theme_transition_generation:
+                return
+            self._theme_animation_id = None
+            self.theme_manager.select(target_name)
+            self._apply_palette()
+            self._display_palette = self.theme_manager.palette
+            self._log(f"Theme transition recovered after a widget update error: {error}")
+            self._theme_finish_id = self.after_idle(self._finish_theme_transition, target_name, generation)
+
+    def _finish_theme_transition(self, target_name, generation):
+        if self.closing or generation != self._theme_transition_generation:
+            return
+        self._theme_finish_id = None
+        try:
+            target = THEMES[target_name]
+            self._apply_palette(palette=target)
+            self._display_palette = dict(target)
+            def refresh_card(widget):
+                if isinstance(widget, ThemeCard):
+                    widget.selected = widget.name == target_name
+                    widget.palette = THEMES[widget.name]
+                    widget._draw()
+                for child in widget.winfo_children():
+                    refresh_card(child)
+            refresh_card(self)
+            for canvas in getattr(self, "_theme_preview_canvases", ()):
+                if canvas.winfo_exists():
+                    self._draw_theme_preview(canvas)
+            self.update_idletasks()
+            self._log(f"Theme loaded: {target_name}.")
+        except (tk.TclError, KeyError, TypeError, ValueError, RuntimeError) as error:
+            self._log(f"Theme transition finalization failed: {error}")
 
     def _rebuild_for_theme(self):
         active_tab = getattr(self, "active_tab", "dashboard")
@@ -746,10 +915,18 @@ class BhopApp(tk.Tk):
     def _apply_theme(self, name):
         if name not in THEME_NAMES or name == self.theme_name:
             return
+        self._theme_transition_generation += 1
+        generation = self._theme_transition_generation
+        if self._theme_animation_id:
+            self.after_cancel(self._theme_animation_id)
+            self._theme_animation_id = None
+        if self._theme_finish_id:
+            self.after_cancel(self._theme_finish_id)
+            self._theme_finish_id = None
+        start = dict(getattr(self, "_display_palette", self.theme_manager.palette))
         self.settings.update(theme=name)
-        self._apply_palette(name)
-        self._rebuild_for_theme()
-        self._log(f"Theme loaded: {name}.")
+        self._transition_target = name
+        self._animate_theme(start, name, THEMES[name], time.perf_counter(), generation)
 
     def _show_setup(self):
         if self.setup_layer or self.closing:
@@ -758,7 +935,7 @@ class BhopApp(tk.Tk):
         self.setup_layer.place(relx=0, rely=0, relwidth=1, relheight=1)
         card = tk.Frame(self.setup_layer, bg=self.PANEL, highlightthickness=1, highlightbackground=self.LINE)
         card.place(relx=0.5, rely=0.5, anchor="center", width=500, height=300)
-        tk.Label(card, text="VELOCITY", bg=self.PANEL, fg=self.RED, font=("Segoe UI Semibold", 9)).pack(anchor="w", padx=30, pady=(28, 0))
+        tk.Label(card, text="DRAGIWARE", bg=self.PANEL, fg=self.RED, font=("Segoe UI Semibold", 9)).pack(anchor="w", padx=30, pady=(28, 0))
         tk.Label(card, text="First-run setup", bg=self.PANEL, fg=self.TEXT, font=("Segoe UI", 22)).pack(anchor="w", padx=30, pady=(7, 0))
         self.setup_status = tk.Label(card, text="Checking system…", bg=self.PANEL, fg=self.MUTED, justify="left", anchor="w", font=("Cascadia Mono", 9))
         self.setup_status.pack(fill="x", padx=30, pady=(22, 0))
@@ -777,7 +954,7 @@ class BhopApp(tk.Tk):
             return
         if self._dependencies_ready():
             self.dependencies_ready = True
-            self.setup_status.configure(text="✓ Runtime\n✓ Dependencies\n\nStarting Velocity…", fg=self.GREEN)
+            self.setup_status.configure(text="✓ Runtime\n✓ Dependencies\n\nStarting DragiWare…", fg=self.GREEN)
             self.setup_action.set_enabled(False)
             self.setup_quit.set_enabled(False)
             self.after(500, self._close_setup)
@@ -804,11 +981,11 @@ class BhopApp(tk.Tk):
             return
         self.setup_prompt_shown = True
         should_download = messagebox.askyesno(
-            title="Velocity component setup",
+            title="DragiWare component setup",
             message=(
                 "Should I do the downloading for the components, "
                 "or are you gonna do it????????\n\n"
-                "Velocity will download the required component automatically "
+                "DragiWare will download the required component automatically "
                 "and verify it before use."
             ),
             parent=self,
@@ -834,7 +1011,7 @@ class BhopApp(tk.Tk):
             return
         self.setup_action.set_enabled(False)
         self.setup_status.configure(text="✓ Runtime\n↓ Downloading required component…\n\nThis can take a moment.", fg=self.MUTED)
-        self.setup_thread = threading.Thread(target=self._install_pymem, name="VelocitySetup", daemon=True)
+        self.setup_thread = threading.Thread(target=self._install_pymem, name="DragiWareSetup", daemon=True)
         self.setup_thread.start()
 
     def _install_pymem(self):
@@ -849,7 +1026,7 @@ class BhopApp(tk.Tk):
             pass
 
     def _download_pymem(self):
-        """Download and verify the pinned pymem wheel into Velocity data."""
+        """Download and verify the pinned pymem wheel into DragiWare data."""
         dependency_root = self.data_directory / "dependencies"
         dependency_root.mkdir(parents=True, exist_ok=True)
         final_directory = self._user_dependency_directory()
@@ -859,7 +1036,7 @@ class BhopApp(tk.Tk):
 
         request = urllib.request.Request(
             PYMEM_METADATA_URL,
-            headers={"User-Agent": f"Velocity/{APP_VERSION}"},
+            headers={"User-Agent": f"DragiWare/{APP_VERSION}"},
         )
         with urllib.request.urlopen(request, timeout=20) as response:
             metadata = json.loads(response.read().decode("utf-8"))
@@ -884,7 +1061,7 @@ class BhopApp(tk.Tk):
         try:
             download_request = urllib.request.Request(
                 wheel["url"],
-                headers={"User-Agent": f"Velocity/{APP_VERSION}"},
+                headers={"User-Agent": f"DragiWare/{APP_VERSION}"},
             )
             digest = hashlib.sha256()
             with urllib.request.urlopen(download_request, timeout=30) as response, wheel_path.open("wb") as output:
@@ -947,17 +1124,29 @@ class BhopApp(tk.Tk):
         self.geometry(f"{width}x{height}+{x}+{y}")
 
     def _register_menu_hotkey(self):
-        self.hotkey_thread = threading.Thread(target=self._menu_hotkey_worker, name="VelocityMenuHotkey", daemon=True)
+        values = self.settings.snapshot()
+        self.menu_toggle_key = values["menu_toggle_key"]
+        self.menu_toggle_modifiers = values["menu_toggle_modifiers"]
+        self.hotkey_thread = threading.Thread(target=self._menu_hotkey_worker, name="DragiWareMenuHotkey", daemon=True)
         self.hotkey_thread.start()
         self.hotkey_ready.wait(0.6)
         if not self.hotkey_registered:
-            self.bind_all("<F5>", lambda _event: self._toggle_menu(), add="+")
-            self._log("Global F5 was unavailable; using the local overlay fallback.")
+            if not self.local_hotkey_bound:
+                self.bind_all("<KeyPress>", self._handle_local_menu_key, add="+")
+                self.local_hotkey_bound = True
+            self._log(f"Global {self._key_name(self.menu_toggle_key, self.menu_toggle_modifiers)} was unavailable; using the local overlay fallback.")
 
     def _menu_hotkey_worker(self):
         self.hotkey_thread_id = int(kernel32.GetCurrentThreadId())
         try:
-            self.hotkey_registered = bool(user32_hotkey.RegisterHotKey(None, 1, 0, MENU_TOGGLE_KEY))
+            self.hotkey_registered = bool(
+                user32_hotkey.RegisterHotKey(
+                    None,
+                    1,
+                    self.menu_toggle_modifiers,
+                    self.menu_toggle_key,
+                )
+            )
             self.hotkey_ready.set()
             if not self.hotkey_registered:
                 return
@@ -987,6 +1176,15 @@ class BhopApp(tk.Tk):
         if self.winfo_exists():
             self.after(30, self._poll_menu_hotkey)
 
+    def _handle_local_menu_key(self, event):
+        if (
+            not self.startup_active
+            and event.keycode == self.menu_toggle_key
+            and self._event_modifiers(event) == self.menu_toggle_modifiers
+        ):
+            self._toggle_menu()
+            return "break"
+
     def _stop_menu_hotkey(self):
         self.hotkey_stop.set()
         if self.hotkey_thread_id:
@@ -994,6 +1192,13 @@ class BhopApp(tk.Tk):
         if self.hotkey_thread and self.hotkey_thread.is_alive():
             self.hotkey_thread.join(timeout=0.6)
         self.hotkey_thread = None
+
+    def _restart_menu_hotkey(self):
+        self._stop_menu_hotkey()
+        self.hotkey_stop = threading.Event()
+        self.hotkey_ready = threading.Event()
+        self.hotkey_registered = False
+        self._register_menu_hotkey()
 
     def _toggle_menu(self):
         if self.startup_active:
@@ -1072,7 +1277,7 @@ class BhopApp(tk.Tk):
         self._draw_logo(mark)
         brand_copy = tk.Frame(brand, bg=self.SIDEBAR)
         brand_copy.pack(side="left")
-        tk.Label(brand_copy, text="velocity", bg=self.SIDEBAR, fg=self.TEXT, font=("Segoe UI Semibold", 19)).pack(anchor="w")
+        tk.Label(brand_copy, text="dragiware", bg=self.SIDEBAR, fg=self.TEXT, font=("Segoe UI Semibold", 19)).pack(anchor="w")
         tk.Label(brand_copy, text="BHOP CONTROL SYSTEM", bg=self.SIDEBAR, fg=self.SUBTLE, font=("Segoe UI Semibold", 7)).pack(anchor="w", pady=(3, 0))
         tk.Frame(sidebar, bg=self.LINE, height=1).pack(fill="x", padx=18, pady=(0, 24))
         tk.Label(sidebar, text="WORKSPACE", bg=self.SIDEBAR, fg=self.SUBTLE, font=("Segoe UI Semibold", 8)).pack(anchor="w", padx=20, pady=(0, 9))
@@ -1081,7 +1286,8 @@ class BhopApp(tk.Tk):
         self._add_nav_item(sidebar, "bhop", "◎", "BHOP", "Primary control")
         self._add_nav_item(sidebar, "activity", "≋", "Activity", "Session ledger")
         self._add_nav_item(sidebar, "socials", "↗", "Socials", "Find the team")
-        self._add_nav_item(sidebar, "updates", "↻", "Updates", "Stable + news")
+        self._add_nav_item(sidebar, "updates", "↻", "Updates", "Verified releases")
+        self._add_nav_item(sidebar, "themes", "✦", "Themes", "Colors + preview")
         self._add_nav_item(sidebar, "settings", "⚙", "Settings", "Preferences")
         spacer = tk.Frame(sidebar, bg=self.SIDEBAR)
         spacer.pack(fill="both", expand=True)
@@ -1095,7 +1301,7 @@ class BhopApp(tk.Tk):
         self.sidebar_state_hint.pack(anchor="w", padx=12, pady=(4, 12))
         sidebar_footer = tk.Frame(sidebar, bg=self.SIDEBAR)
         sidebar_footer.pack(side="bottom", fill="x", padx=20, pady=(0, 19))
-        tk.Label(sidebar_footer, text=f"VELOCITY V{APP_DISPLAY_VERSION}", bg=self.SIDEBAR, fg=self.SUBTLE, font=("Segoe UI Semibold", 7)).pack(side="left")
+        tk.Label(sidebar_footer, text=f"DRAGIWARE V{APP_DISPLAY_VERSION}", bg=self.SIDEBAR, fg=self.SUBTLE, font=("Segoe UI Semibold", 7)).pack(side="left")
         tk.Label(sidebar_footer, text=f"  •  {BUILD_CHANNEL.upper()} {BUILD_TYPE.upper()}", bg=self.SIDEBAR, fg=self.SUBTLE, font=("Segoe UI Semibold", 7)).pack(side="left")
 
         main = tk.Frame(shell, bg=self.BG)
@@ -1107,7 +1313,7 @@ class BhopApp(tk.Tk):
         title_group.pack(side="left", anchor="sw", pady=(0, 13))
         self.page_eyebrow = tk.Label(title_group, text="CONTROL CENTER  /  OVERVIEW", bg=self.BG, fg=self.SUBTLE, font=("Segoe UI Semibold", 8))
         self.page_eyebrow.pack(anchor="w")
-        self.page_title = tk.Label(title_group, text="Velocity is ready.", bg=self.BG, fg=self.TEXT, font=("Segoe UI", 20))
+        self.page_title = tk.Label(title_group, text="DragiWare is ready.", bg=self.BG, fg=self.TEXT, font=("Segoe UI", 20))
         self.page_title.pack(anchor="w", pady=(5, 0))
         chrome = tk.Frame(topbar, bg=self.BG)
         chrome.pack(side="right", anchor="sw", pady=(0, 13))
@@ -1137,7 +1343,9 @@ class BhopApp(tk.Tk):
         self.updates_page = self.updates_scroll.body
         self.settings_scroll = ScrollArea(self.content, self.BG)
         self.settings_page = self.settings_scroll.body
-        self.pages = {"dashboard": self.status_scroll, "bhop": self.bhop_scroll, "activity": self.activity_scroll, "socials": self.socials_scroll, "updates": self.updates_scroll, "settings": self.settings_scroll}
+        self.themes_scroll = ScrollArea(self.content, self.BG)
+        self.themes_page = self.themes_scroll.body
+        self.pages = {"dashboard": self.status_scroll, "bhop": self.bhop_scroll, "activity": self.activity_scroll, "socials": self.socials_scroll, "updates": self.updates_scroll, "themes": self.themes_scroll, "settings": self.settings_scroll}
         self.start_buttons = []
         self.stop_buttons = []
         self.toggle_buttons = []
@@ -1147,6 +1355,7 @@ class BhopApp(tk.Tk):
         self._build_activity_page()
         self._build_socials_page()
         self._build_updates_page()
+        self._build_themes_page()
         self._build_settings_page()
         self.show_tab(getattr(self, "active_tab", "dashboard"))
         if announce:
@@ -1165,7 +1374,9 @@ class BhopApp(tk.Tk):
         candidates = []
         if getattr(sys, "_MEIPASS", None):
             candidates.append(Path(sys._MEIPASS) / filename)
-        candidates.append(Path(__file__).resolve().parent / filename)
+        source_directory = Path(__file__).resolve().parent
+        candidates.append(source_directory / filename)
+        candidates.append(source_directory.parent / "assets" / filename)
         candidates.append(Path(sys.executable).resolve().parent / filename)
         return next((path for path in candidates if path.exists()), None)
 
@@ -1247,7 +1458,7 @@ class BhopApp(tk.Tk):
             page.pack_forget()
         page = self.pages[tab]
         page.pack(fill="both", expand=True)
-        labels = {"dashboard": ("CONTROL CENTER  /  OVERVIEW", "Velocity is ready."), "bhop": ("WORKSPACE  /  BHOP", "Control deck."), "activity": ("WORKSPACE  /  ACTIVITY", "Activity stream."), "socials": ("NETWORK  /  SOCIALS", "Stay in the loop."), "updates": ("RELEASE CHANNEL  /  UPDATES", "Stay current."), "settings": ("APPLICATION  /  SETTINGS", "Fine tune your setup.")}
+        labels = {"dashboard": ("CONTROL CENTER  /  OVERVIEW", "DragiWare is ready."), "bhop": ("WORKSPACE  /  BHOP", "Control deck."), "activity": ("WORKSPACE  /  ACTIVITY", "Activity stream."), "socials": ("NETWORK  /  SOCIALS", "Stay in the loop."), "updates": ("RELEASE CHANNEL  /  UPDATES", "Stay current."), "themes": ("APPEARANCE  /  THEMES", "Make DragiWare yours."), "settings": ("APPLICATION  /  SETTINGS", "Fine tune your setup.")}
         eyebrow, title = labels[tab]
         self.page_eyebrow.configure(text=eyebrow)
         self.page_title.configure(text=title)
@@ -1392,7 +1603,7 @@ class BhopApp(tk.Tk):
             self.dashboard_bhop_value.pack(anchor="w")
             self.dashboard_connection_value.pack(anchor="w", pady=(4, 0))
         else:
-            self.dashboard_bhop_value.pack(side="left")  # hmpf, looking at source huh i have nothing to hide 
+            self.dashboard_bhop_value.pack(side="left")
             self.dashboard_connection_value.pack(side="left", padx=(23, 0))
         self.dashboard_summary_stacked = stacked
 
@@ -1505,33 +1716,46 @@ class BhopApp(tk.Tk):
         intro = tk.Frame(page, bg=self.BG)
         intro.pack(fill="x", pady=(8, 18))
         tk.Label(intro, text="SESSION LEDGER", bg=self.BG, fg=self.SUBTLE, font=("Segoe UI Semibold", 8)).pack(anchor="w")
-        tk.Label(intro, text="Live events and diagnostics are saved after each launch.", bg=self.BG, fg=self.MUTED, font=("Segoe UI", 9)).pack(anchor="w", pady=(7, 0))
-        logs = RoundedPanel(page, self.PANEL, height=365, radius=18, inset=20)
+        tk.Label(intro, text="Connection state, focus checks, and errors are saved after each launch.", bg=self.BG, fg=self.MUTED, font=("Segoe UI", 9)).pack(anchor="w", pady=(7, 0))
+        logs = RoundedPanel(page, self.PANEL, height=425, radius=18, inset=20)
         logs.pack(fill="both", expand=True)
         header = tk.Frame(logs.body, bg=self.PANEL)
         header.pack(fill="x", pady=(0, 14))
-        self._eyebrow(header, "LIVE OUTPUT").pack(side="left")
-        tk.Label(header, text="Saved to bunnyhop logs", bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 8)).pack(side="right")
-        log_body = RoundedPanel(logs.body, self.ALT, height=265, radius=13, inset=12)
+        self._eyebrow(header, "LIVE DIAGNOSTICS").pack(side="left")
+        copy_button = RoundedButton(header, "Copy", self._copy_activity_log, self.BUTTON, self.TEXT, width=64, height=28)
+        copy_button.pack(side="right")
+        clear_button = RoundedButton(header, "Clear", self._clear_activity_log, self.INPUT, self.TEXT, width=64, height=28)
+        clear_button.pack(side="right", padx=(0, 8))
+        self.activity_log_status = tk.Label(header, text="0 EVENTS  •  SAVED", bg=self.PANEL, fg=self.MUTED, font=("Cascadia Mono", 8))
+        self.activity_log_status.pack(side="right", padx=(0, 12))
+        log_body = RoundedPanel(logs.body, self.ALT, height=322, radius=13, inset=12)
         log_body.pack(fill="both", expand=True)
-        self.log = tk.Text(log_body.body, height=12, bg=self.ALT, fg=self.TEXT, insertbackground=self.TEXT, relief="flat", borderwidth=0, highlightthickness=0, font=("Cascadia Mono", 9), padx=2, pady=2, state="disabled", wrap="word")
-        self.log.pack(fill="both", expand=True)
+        self.log = tk.Text(log_body.body, height=15, bg=self.ALT, fg=self.TEXT, insertbackground=self.TEXT, relief="flat", borderwidth=0, highlightthickness=0, font=("Cascadia Mono", 9), padx=2, pady=2, state="disabled", wrap="word")
+        log_scrollbar = tk.Scrollbar(log_body.body, command=self.log.yview, bg=self.ALT, activebackground=self.PANEL, troughcolor=self.ALT, relief="flat", width=10)
+        self.log.configure(yscrollcommand=log_scrollbar.set)
+        self.log.tag_configure("info", foreground=self.TEXT)
+        self.log.tag_configure("warning", foreground=self.WARNING)
+        self.log.tag_configure("error", foreground=self.RED)
+        self.log.tag_configure("success", foreground=self.GREEN)
+        self.log.pack(side="left", fill="both", expand=True)
+        log_scrollbar.pack(side="right", fill="y", padx=(8, 0))
+        self._activity_line_count = 0
         changes = RoundedPanel(page, self.PANEL, height=100, radius=18, inset=20, autosize="height")
         changes.pack(fill="x", pady=(14, 0))
         self._eyebrow(changes.body, f"RELEASE NOTES  •  V{APP_DISPLAY_VERSION}").pack(anchor="w")
         tk.Label(changes.body, text=CHANGELOG[0][1], bg=self.PANEL, fg=self.TEXT, font=("Segoe UI", 9), justify="left", wraplength=700).pack(anchor="w", pady=(10, 0))
-        tk.Label(changes.body, text="Previous: " + "  •  ".join(version for version, _note in CHANGELOG[1:]), bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 8)).pack(anchor="w", pady=(5, 0))  # little easter egg(there are two ^^), 28.11 is my bday!, My wish is you to have fun with this project!(if ever someone will see this prob not but it is cool ^^ and if you care im listening to bailando right now)
+        tk.Label(changes.body, text="Previous: " + "  •  ".join(version for version, _note in CHANGELOG[1:]), bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 8)).pack(anchor="w", pady=(5, 0))
 
     def _build_socials_page(self):
         page = self.socials_page
         intro = tk.Frame(page, bg=self.BG)
         intro.pack(fill="x", pady=(8, 24))
         tk.Label(intro, text="NETWORK", bg=self.BG, fg=self.SUBTLE, font=("Segoe UI Semibold", 8)).pack(anchor="w")
-        tk.Label(intro, text="Follow the project or reach out when you need a hand.", bg=self.BG, fg=self.MUTED, font=("Segoe UI", 9)).pack(anchor="w", pady=(7, 0))
+        tk.Label(intro, text="Open the official project page or report an issue.", bg=self.BG, fg=self.MUTED, font=("Segoe UI", 9)).pack(anchor="w", pady=(7, 0))
         cards = tk.Frame(page, bg=self.BG)
         cards.pack(fill="x")
-        self._social_card(cards, "GH", "SOURCE / UPDATES", "GitHub", "Follow the project and keep up with the latest changes.", "github.com/yxzroot/bhop-script-", "https://github.com/yxzroot/bhop-script-").pack(side="left", fill="both", expand=True, padx=(0, 8))
-        self._social_card(cards, "TG", "DIRECT CONTACT", "Telegram", "Contact xyz for bugs or help.", "@minkcy", "https://t.me/minkcy").pack(side="left", fill="both", expand=True, padx=(8, 0))
+        self._social_card(cards, "GH", "SOURCE / RELEASES", "GitHub", "View the official source and published releases.", "github.com/yxzroot/cs2-bhop", "https://github.com/yxzroot/cs2-bhop").pack(side="left", fill="both", expand=True, padx=(0, 8))
+        self._social_card(cards, "!", "SUPPORT / ISSUES", "Report an issue", "Include a copied Activity log when reporting a problem.", "github.com/yxzroot/cs2-bhop/issues", "https://github.com/yxzroot/cs2-bhop/issues").pack(side="left", fill="both", expand=True, padx=(8, 0))
         note = RoundedPanel(page, self.PANEL, height=84, radius=16, inset=18, autosize="height")
         note.pack(fill="x", pady=(18, 0))
         tk.Label(note.body, text="●", bg=self.PANEL, fg=self.GREEN, font=("Segoe UI", 12)).pack(side="left", padx=(0, 10))
@@ -1566,14 +1790,14 @@ class BhopApp(tk.Tk):
         intro = tk.Frame(page, bg=self.BG)
         intro.pack(fill="x", pady=(8, 18))
         tk.Label(intro, text="RELEASE CHANNEL", bg=self.BG, fg=self.SUBTLE, font=("Segoe UI Semibold", 8)).pack(anchor="w")
-        tk.Label(intro, text="Stable downloads, beta notes, and project news in one place.", bg=self.BG, fg=self.MUTED, font=("Segoe UI", 9)).pack(anchor="w", pady=(7, 0))
+        tk.Label(intro, text="Updates are checked from the official release source and always require your approval.", bg=self.BG, fg=self.MUTED, font=("Segoe UI", 9)).pack(anchor="w", pady=(7, 0))
 
         row = tk.Frame(page, bg=self.BG)
         row.pack(fill="x")
         row.grid_columnconfigure(0, weight=3, uniform="update_cards")
         row.grid_columnconfigure(1, weight=2, uniform="update_cards")
 
-        updates = RoundedPanel(row, self.PANEL, height=246, radius=18, inset=20)
+        updates = RoundedPanel(row, self.PANEL, height=220, radius=18, inset=20)
         updates.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         self._card_heading(updates.body, "UPDATE CHANNEL", "Stable releases", "SAFE")
         update_meta = tk.Frame(updates.body, bg=self.PANEL)
@@ -1589,112 +1813,160 @@ class BhopApp(tk.Tk):
         update_options = tk.Frame(update_controls, bg=self.PANEL)
         update_options.pack(side="left")
         self.auto_check_var = tk.BooleanVar(value=self.settings.snapshot().get("auto_check_updates", True))
-        self.auto_download_var = tk.BooleanVar(value=self.settings.snapshot().get("auto_download_updates", True))
         tk.Checkbutton(update_options, text="Check automatically", variable=self.auto_check_var, command=self._toggle_auto_check, bg=self.PANEL, fg=self.TEXT, selectcolor=self.INPUT, activebackground=self.PANEL, activeforeground=self.TEXT, font=("Segoe UI", 8), relief="flat", highlightthickness=0).pack(anchor="w")
-        tk.Checkbutton(update_options, text="Download stable updates", variable=self.auto_download_var, command=self._toggle_auto_download, bg=self.PANEL, fg=self.TEXT, selectcolor=self.INPUT, activebackground=self.PANEL, activeforeground=self.TEXT, font=("Segoe UI", 8), relief="flat", highlightthickness=0).pack(anchor="w", pady=(3, 0))
         self.update_button = RoundedButton(update_controls, "Check for Updates", self._update_action, self.BUTTON, self.TEXT, width=140, height=32)
         self.update_button.pack(side="right")
 
-        channel = RoundedPanel(row, self.PANEL, height=246, radius=18, inset=20)
+        channel = RoundedPanel(row, self.PANEL, height=220, radius=18, inset=20)
         channel.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-        self._card_heading(channel.body, "CURRENT BUILD", "Velocity channel", BUILD_CHANNEL.upper())
+        self._card_heading(channel.body, "CURRENT BUILD", "DragiWare channel", BUILD_CHANNEL.upper())
         tk.Label(channel.body, text=f"v{APP_DISPLAY_VERSION}", bg=self.PANEL, fg=self.RED, font=("Segoe UI Semibold", 26)).pack(anchor="w", pady=(24, 0))
         tk.Label(channel.body, text=f"{BUILD_CHANNEL} channel  /  {BUILD_TYPE} build", bg=self.PANEL, fg=self.TEXT, font=("Segoe UI Semibold", 10)).pack(anchor="w", pady=(3, 0))
-        tk.Label(channel.body, text=f"Build identity: {BUILD_FLAVOR}\nStable update downloads remain verified and opt-in through the controls beside this card.", bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 8), justify="left", wraplength=260).pack(anchor="w", pady=(12, 0))
+        tk.Label(channel.body, text=f"Build identity: {BUILD_FLAVOR}\nDownloads and restarts happen only after you confirm them.", bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 8), justify="left", wraplength=260).pack(anchor="w", pady=(12, 0))
 
-        news = RoundedPanel(page, self.PANEL, height=230, radius=18, inset=20, autosize="height")
-        news.pack(fill="x", pady=(14, 0))
-        news_header = self._card_heading(news.body, "OFFICIAL FEED", "Velocity news")
-        self.news_refresh_button = RoundedButton(news_header, "Refresh", self._refresh_news, self.BUTTON, self.TEXT, width=92, height=28)
-        self.news_refresh_button.pack(side="right", anchor="n")
-        self.news_status_label = tk.Label(news.body, text="●  Loading official announcements…", bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 8), anchor="w")
-        self.news_status_label.pack(fill="x", pady=(12, 0))
-        self.news_feed = tk.Frame(news.body, bg=self.PANEL)
-        self.news_feed.pack(fill="x", pady=(12, 0))
-        self._render_news()
-        if self.news_check_running:
-            self.news_refresh_button.set_enabled(False)
+    def _build_themes_page_legacy(self):
+        page = self.themes_page
+        page.configure(bg=self.BG)
+        self._card_heading(page, "THEME LIBRARY", "Choose your DragiWare look.", "LIVE PREVIEW").pack(fill="x", pady=(8, 18))
+        preview = tk.Frame(page, bg=self.PANEL, highlightthickness=1, highlightbackground=self.LINE)
+        preview.pack(fill="x", pady=(0, 18))
+        preview_left = tk.Frame(preview, bg=self.PANEL)
+        preview_left.pack(side="left", fill="both", expand=True, padx=18, pady=16)
+        tk.Label(preview_left, text="LIVE PREVIEW", bg=self.PANEL, fg=self.RED, font=("Segoe UI Semibold", 8)).pack(anchor="w")
+        tk.Label(preview_left, text=f"{self.theme_name} theme", bg=self.PANEL, fg=self.TEXT, font=("Segoe UI Semibold", 13)).pack(anchor="w", pady=(4, 10))
+        preview_ui = tk.Frame(preview_left, bg=self.BG, highlightthickness=1, highlightbackground=self.LINE)
+        preview_ui.pack(fill="x")
+        header = tk.Frame(preview_ui, bg=self.SIDEBAR, height=34)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        tk.Label(header, text="dragiware", bg=self.SIDEBAR, fg=self.LOGO_PRIMARY, font=("Segoe UI Semibold", 10)).pack(side="left", padx=12)
+        tk.Label(header, text="THEMES  •  SETTINGS  •  BHOP", bg=self.SIDEBAR, fg=self.MUTED, font=("Segoe UI", 8)).pack(side="right", padx=12)
+        preview_body = tk.Frame(preview_ui, bg=self.BG)
+        preview_body.pack(fill="x", padx=10, pady=10)
+        panel = tk.Frame(preview_body, bg=self.PANEL, highlightthickness=1, highlightbackground=self.LINE)
+        panel.pack(fill="x")
+        tk.Label(panel, text="Session control", bg=self.PANEL, fg=self.TEXT, font=("Segoe UI Semibold", 10)).pack(anchor="w", padx=12, pady=(10, 2))
+        tk.Label(panel, text="Ready to start  •  live theme rendering", bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 8)).pack(anchor="w", padx=12)
+        actions = tk.Frame(panel, bg=self.PANEL)
+        actions.pack(anchor="w", padx=12, pady=10)
+        tk.Button(actions, text="ACTIVE", bg=self.RED, fg=self.TEXT, activebackground=self.ACCENT_HOVER, relief="flat", bd=0, padx=12, pady=4).pack(side="left")
+        tk.Button(actions, text="Secondary", bg=self.BUTTON, fg=self.TEXT, activebackground=self.BUTTON_HOVER, relief="flat", bd=0, padx=12, pady=4).pack(side="left", padx=8)
+        tk.Label(actions, text="Accent / selected / border states", bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 8)).pack(side="left")
+        tk.Label(page, text="THEMES", bg=self.BG, fg=self.MUTED, font=("Segoe UI Semibold", 8)).pack(anchor="w", pady=(0, 8))
+        grid = tk.Frame(page, bg=self.BG)
+        grid.pack(fill="x")
+        for index, name in enumerate(THEME_NAMES):
+            palette = THEMES[name]
+            card = tk.Frame(grid, bg=self.PANEL, highlightthickness=2 if name == self.theme_name else 1,
+                            highlightbackground=self.RED if name == self.theme_name else self.LINE, cursor="hand2")
+            card.grid(row=index // 4, column=index % 4, sticky="nsew", padx=(0 if index % 4 == 0 else 6, 6), pady=(0, 10))
+            grid.grid_columnconfigure(index % 4, weight=1)
+            title = f"{name}  ✓" if name == self.theme_name else name
+            tk.Label(card, text=title, bg=self.PANEL, fg=self.RED if name == self.theme_name else self.TEXT,
+                     font=("Segoe UI Semibold", 10), anchor="w").pack(fill="x", padx=10, pady=(10, 7))
+            swatches = tk.Frame(card, bg=self.PANEL)
+            swatches.pack(fill="x", padx=10)
+            for key, label in (("accent", "A"), ("blue", "S"), ("bg", "B"), ("text", "T")):
+                swatch = tk.Frame(swatches, bg=palette[key], width=22, height=22,
+                                  highlightthickness=1, highlightbackground=palette["line"])
+                swatch.pack(side="left", padx=(0, 5))
+                swatch.pack_propagate(False)
+                tk.Label(swatch, text=label, bg=palette[key], fg=palette["text"], font=("Segoe UI", 7)).pack(expand=True)
+            tk.Label(card, text="Accent  •  Secondary  •  Background  •  Text", bg=self.PANEL,
+                     fg=self.MUTED, font=("Segoe UI", 7), anchor="w").pack(fill="x", padx=10, pady=(7, 10))
+            self._bind_theme_card(card, name)
+        background = tk.Frame(page, bg=self.PANEL, highlightthickness=1, highlightbackground=self.LINE)
+        background.pack(fill="x", pady=(8, 16))
+        tk.Label(background, text="BACKGROUND", bg=self.PANEL, fg=self.RED, font=("Segoe UI Semibold", 8)).pack(anchor="w", padx=16, pady=(14, 3))
+        background_name = THEMES[self.theme_name].get("background")
+        message = f"Artwork: {background_name}" if background_name else "No background artwork is enabled for this theme."
+        tk.Label(background, text=message, bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 9)).pack(anchor="w", padx=16, pady=(0, 14))
 
-    @staticmethod
-    def _news_summary(text):
-        cleaned = " ".join(line.strip() for line in str(text).splitlines() if line.strip())
-        for marker in ("#", "*", "`", ">"):
-            cleaned = cleaned.replace(marker, "")
-        return cleaned[:240].rstrip() + ("…" if len(cleaned) > 240 else "")
+    def _bind_theme_card(self, widget, name):
+        widget.bind("<Button-1>", lambda _event, theme=name: self._apply_theme(theme))
+        for child in widget.winfo_children():
+            self._bind_theme_card(child, name)
 
-    @staticmethod
-    def _news_date(value):
-        try:
-            return time.strftime("%d %b %Y", time.strptime(value[:19], "%Y-%m-%dT%H:%M:%S"))
-        except (TypeError, ValueError):
-            return "Official channel"
+    def _build_themes_page(self):
+        page = self.themes_page
+        page.configure(bg=self.BG)
+        self._theme_preview_canvases = []
+        intro = tk.Frame(page, bg=self.BG)
+        intro.pack(fill="x", pady=(8, 16))
+        intro_header = tk.Frame(intro, bg=self.BG)
+        intro_header.pack(fill="x")
+        tk.Label(intro_header, text="APPEARANCE", bg=self.BG, fg=self.SUBTLE, font=("Segoe UI Semibold", 8)).pack(side="left")
+        tk.Label(
+            intro_header,
+            text="these are vibecoded dont be mad at me!!!",
+            bg=self.BG,
+            fg=self.MUTED,
+            font=("Segoe UI", 8),
+        ).pack(side="right")
+        tk.Label(intro, text="Themes", bg=self.BG, fg=self.TEXT, font=("Segoe UI", 22)).pack(anchor="w", pady=(4, 0))
+        tk.Label(intro, text="Pick a palette and see it in context before you apply it.", bg=self.BG, fg=self.MUTED, font=("Segoe UI", 9)).pack(anchor="w", pady=(5, 0))
 
-    def _render_news(self):
-        if not hasattr(self, "news_feed") or not self.news_feed.winfo_exists():
+        preview = RoundedPanel(page, self.PANEL, height=174, radius=18, inset=18)
+        preview.pack(fill="x", pady=(0, 20))
+        self._card_heading(preview.body, "PREVIEW", f"{self.theme_name} theme", "LIVE").pack(fill="x")
+        preview_ui = tk.Canvas(preview.body, height=82, bg=self.BG, bd=0, highlightthickness=0)
+        preview_ui.pack(fill="x", pady=(14, 0))
+        self._theme_preview_canvases.append(preview_ui)
+        preview_ui.bind("<Configure>", lambda _event: self._draw_theme_preview(preview_ui))
+        self._draw_theme_preview(preview_ui)
+
+        section = tk.Frame(page, bg=self.BG)
+        section.pack(fill="x", pady=(0, 10))
+        tk.Label(section, text="THEMES", bg=self.BG, fg=self.TEXT, font=("Segoe UI Semibold", 11)).pack(side="left")
+        tk.Label(section, text=f"{len(THEME_NAMES)} palettes", bg=self.BG, fg=self.MUTED, font=("Segoe UI", 8)).pack(side="right", pady=2)
+        grid = tk.Frame(page, bg=self.BG)
+        grid.pack(fill="x")
+        for index, name in enumerate(THEME_NAMES):
+            palette = THEMES[name]
+            card = ThemeCard(grid, name, palette, name == self.theme_name, self._apply_theme)
+            card.grid(row=index // 3, column=index % 3, sticky="nsew", padx=(0 if index % 3 == 0 else 6, 6), pady=(0, 12))
+            grid.grid_columnconfigure(index % 3, weight=1)
+            title = f"{name}  •  ACTIVE" if name == self.theme_name else name
+            card_body_bg = palette["alt"] if name == self.theme_name else palette["panel"]
+            tk.Label(card.body, text=title, bg=card_body_bg, fg=palette["accent"] if name == self.theme_name else palette["text"], font=("Segoe UI Semibold", 10), anchor="w").pack(fill="x")
+            mini = tk.Canvas(card.body, height=58, bg=card_body_bg, bd=0, highlightthickness=0)
+            mini.pack(fill="x", pady=(9, 8))
+            mini.bind("<Configure>", lambda _event, canvas=mini, colors=palette: self._draw_mini_theme(canvas, colors))
+            self._draw_mini_theme(mini, palette)
+            tk.Label(card.body, text="Accent  ·  Secondary  ·  Background  ·  Text", bg=card_body_bg, fg=palette["muted"], font=("Segoe UI", 7), anchor="w").pack(fill="x")
+            self._bind_theme_card(card, name)
+
+        background = RoundedPanel(page, self.PANEL, height=76, radius=18, inset=18, autosize="height")
+        background.pack(fill="x", pady=(8, 18))
+        self._card_heading(background.body, "BACKGROUND", "Theme artwork", "OPTIONAL").pack(fill="x")
+        background_name = THEMES[self.theme_name].get("background")
+        message = f"{background_name} is active for this theme." if background_name else "This theme uses a clean solid background."
+        tk.Label(background.body, text=message, bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 8)).pack(anchor="w", pady=(10, 0))
+
+    def _draw_mini_theme(self, canvas, palette):
+        if not canvas.winfo_exists():
             return
-        for child in self.news_feed.winfo_children():
-            child.destroy()
-        if not self.news_items:
-            tk.Label(self.news_feed, text="No announcements loaded yet. Tap Refresh to check the official channel.", bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 9), anchor="w").pack(fill="x", pady=(0, 4))
-            return
-        for item in self.news_items:
-            entry = tk.Frame(self.news_feed, bg=self.ALT, highlightthickness=1, highlightbackground=self.LINE, padx=14, pady=11)
-            entry.pack(fill="x", pady=(0, 8))
-            meta = tk.Frame(entry, bg=self.ALT)
-            meta.pack(fill="x")
-            channel = "BETA" if item.prerelease else "RELEASE"
-            tk.Label(meta, text=f"{channel}  /  v{item.version}", bg=self.ALT, fg=self.RED if item.prerelease else self.GREEN, font=("Cascadia Mono", 8)).pack(side="left")
-            tk.Label(meta, text=self._news_date(item.published_at), bg=self.ALT, fg=self.SUBTLE, font=("Segoe UI", 8)).pack(side="right")
-            tk.Label(entry, text=item.title, bg=self.ALT, fg=self.TEXT, font=("Segoe UI Semibold", 10), anchor="w").pack(fill="x", pady=(5, 0))
-            tk.Label(entry, text=self._news_summary(item.notes), bg=self.ALT, fg=self.MUTED, font=("Segoe UI", 8), justify="left", anchor="w", wraplength=760).pack(fill="x", pady=(4, 0))
-            if item.url:
-                link = tk.Label(entry, text="Open announcement  →", bg=self.ALT, fg=self.RED, font=("Cascadia Mono", 8), cursor="hand2")
-                link.pack(anchor="w", pady=(6, 0))
-                link.bind("<Button-1>", lambda _event, address=item.url: webbrowser.open(address))
+        width, height = max(canvas.winfo_width(), 2), max(canvas.winfo_height(), 2)
+        canvas.delete("all")
+        canvas.create_rectangle(1, 1, width - 1, height - 1, fill=palette["bg"], outline=palette["line"])
+        canvas.create_rectangle(9, 9, width - 9, height - 9, fill=palette["panel"], outline="")
+        canvas.create_rectangle(18, 18, max(19, width * 0.42), 22, fill=palette["accent"], outline="")
+        canvas.create_rectangle(18, 29, max(19, width * 0.68), 32, fill=palette["muted"], outline="")
+        canvas.create_rectangle(width - 64, height - 21, width - 18, height - 12, fill=palette["accent"], outline="")
 
-    def _startup_news_check(self):
-        if self.closing:
+    def _draw_theme_preview(self, canvas):
+        if not canvas.winfo_exists():
             return
-        self._refresh_news(silent=True)
-
-    def _refresh_news(self, silent=False):
-        if self.news_check_running:
-            return
-        self.news_check_running = True
-        if hasattr(self, "news_status_label"):
-            self.news_status_label.configure(text="●  Checking the official news channel…", fg=self.MUTED)
-            self.news_refresh_button.set_enabled(False)
-        self.news_thread = threading.Thread(target=self._news_worker, args=(silent,), name="VelocityNews", daemon=True)
-        self.news_thread.start()
-
-    def _news_worker(self, silent):
-        error = None
-        items = []
-        try:
-            items = self.updater.fetch_news()
-        except Exception as exc:
-            error = str(exc)
-        try:
-            self.after(0, self._finish_news_refresh, items, error, silent)
-        except tk.TclError:
-            pass
-
-    def _finish_news_refresh(self, items, error, silent=False):
-        self.news_check_running = False
-        if error:
-            if hasattr(self, "news_status_label"):
-                self.news_status_label.configure(text="●  News unavailable — your current install is safe.", fg=self.WARNING)
-                self.news_refresh_button.set_enabled(True)
-            self._log(f"News refresh failed: {error}")
-            return
-        self.news_items = items
-        self._render_news()
-        if hasattr(self, "news_status_label"):
-            count = len(items)
-            self.news_status_label.configure(text=f"●  Official channel  /  {count} announcement{'s' if count != 1 else ''}", fg=self.GREEN)
-            self.news_refresh_button.set_enabled(True)
-        if not silent:
-            self._log(f"Loaded {len(items)} official news announcement{'s' if len(items) != 1 else ''}.")
+        palette = getattr(self, "_display_palette", THEMES[self.theme_name])
+        width, height = max(canvas.winfo_width(), 2), max(canvas.winfo_height(), 2)
+        canvas.delete("all")
+        canvas.create_rectangle(1, 1, width - 1, height - 1, fill=palette["bg"], outline=palette["line"])
+        canvas.create_rectangle(12, 12, width - 12, height - 12, fill=palette["panel"], outline="")
+        canvas.create_rectangle(25, 24, max(26, width * 0.28), 29, fill=palette["logo_primary"], outline="")
+        canvas.create_rectangle(25, 40, max(26, width * 0.52), 44, fill=palette["text"], outline="")
+        canvas.create_rectangle(25, 52, max(26, width * 0.43), 55, fill=palette["muted"], outline="")
+        canvas.create_rectangle(width - 128, 31, width - 76, 49, fill=palette["button"], outline="")
+        canvas.create_rectangle(width - 68, 31, width - 22, 49, fill=palette["accent"], outline="")
 
     def _build_settings_page(self):
         page = self.settings_page
@@ -1709,9 +1981,13 @@ class BhopApp(tk.Tk):
         menu_row.pack(fill="x", pady=(21, 0))
         menu_copy = tk.Frame(menu_row, bg=self.PANEL)
         menu_copy.pack(side="left")
-        tk.Label(menu_copy, text="Menu key", bg=self.PANEL, fg=self.TEXT, font=("Segoe UI Semibold", 10)).pack(anchor="w")
-        tk.Label(menu_copy, text="Fixed overlay toggle; never changes BHOP settings.", bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 8)).pack(anchor="w", pady=(5, 0))
-        tk.Label(menu_row, text="F5", bg=self.INPUT, fg=self.RED, font=("Cascadia Mono", 9), padx=12, pady=6).pack(side="right")
+        tk.Label(menu_copy, text="Menu Toggle Keybind", bg=self.PANEL, fg=self.TEXT, font=("Segoe UI Semibold", 10)).pack(anchor="w")
+        tk.Label(menu_copy, text="Open or hide the menu without stopping DragiWare.", bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 8)).pack(anchor="w", pady=(5, 0))
+        self.menu_toggle_key_label = tk.Label(menu_row, text=self._key_name(self.menu_toggle_key, self.menu_toggle_modifiers), bg=self.INPUT, fg=self.RED, font=("Cascadia Mono", 9), padx=12, pady=6)
+        self.menu_toggle_key_label.pack(side="left", padx=(0, 8))
+        self.menu_toggle_change_button = RoundedButton(menu_row, "Change", lambda: self._begin_key_capture("menu"), self.INPUT, self.TEXT, width=68, height=28)
+        self.menu_toggle_change_button.pack(side="right")
+        ToolTip(self.menu_toggle_change_button, "Click, then press a keyboard key or combination; mouse buttons are not supported.")
         tk.Frame(panel.body, bg=self.LINE, height=1).pack(fill="x", pady=(18, 0))
         options = tk.Frame(panel.body, bg=self.PANEL)
         options.pack(fill="x", pady=(17, 0))
@@ -1737,15 +2013,10 @@ class BhopApp(tk.Tk):
 
         appearance = RoundedPanel(page, self.PANEL, height=112, radius=18, inset=20, autosize="height")
         appearance.pack(fill="x", pady=(14, 0))
-        self._card_heading(appearance.body, "APPEARANCE", "Theme", "LIVE")
-        theme_row = tk.Frame(appearance.body, bg=self.PANEL)
-        theme_row.pack(fill="x", pady=(16, 0))
-        tk.Label(theme_row, text="Choose a complete Velocity palette.", bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 8)).pack(side="left")
-        self.theme_var = tk.StringVar(value=self.theme_name)
-        theme_menu = tk.OptionMenu(theme_row, self.theme_var, *THEME_NAMES, command=self._apply_theme)
-        theme_menu.configure(bg=self.INPUT, fg=self.TEXT, activebackground=self.BUTTON_HOVER, activeforeground=self.TEXT, highlightthickness=0, bd=0, font=("Segoe UI Semibold", 9), width=14)
-        theme_menu["menu"].configure(bg=self.PANEL, fg=self.TEXT, activebackground=self.NAV_ACTIVE, activeforeground=self.TEXT, font=("Segoe UI", 9))
-        theme_menu.pack(side="right")
+        self._card_heading(appearance.body, "BACKGROUND", "Theme artwork", "OPTIONAL")
+        background_name = THEMES[self.theme_name].get("background")
+        background_text = f"{background_name} is active for this theme." if background_name else "This theme uses a clean solid background."
+        tk.Label(appearance.body, text=background_text, bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 8)).pack(anchor="w", pady=(16, 0))
 
         guide = RoundedPanel(page, self.PANEL, height=132, radius=18, inset=20, autosize="height")
         guide.pack(fill="x", pady=(14, 0))
@@ -1764,7 +2035,7 @@ class BhopApp(tk.Tk):
         if hasattr(self, "update_status_label"):
             self.update_status_label.configure(text="●  Checking official stable releases…", fg=self.MUTED)
             self.update_button.set_enabled(False)
-        self.update_thread = threading.Thread(target=self._check_updates_worker, args=(silent,), name="VelocityUpdater", daemon=True)
+        self.update_thread = threading.Thread(target=self._check_updates_worker, args=(silent,), name="DragiWareUpdater", daemon=True)
         self.update_thread.start()
 
     def _check_updates_worker(self, silent):
@@ -1802,15 +2073,18 @@ class BhopApp(tk.Tk):
         self.update_button.set_enabled(True)
         self.update_button.set_text("Download Update")
         self._log(f"Stable update available: v{release.version}.")
-        if self.settings.snapshot().get("auto_download_updates", True):
-            self._download_update()
+        if not getattr(sys, "frozen", False):
+            self.update_status_label.configure(text="●  Stable update available — packaged release required", fg=self.WARNING)
+            self._log("Update download skipped while running from source.")
+            return
+        self._show_update_available_dialog(release)
 
     def _download_update(self):
         if not self.update_info or (self.update_thread and self.update_thread.is_alive()):
             return
         self.update_button.set_enabled(False)
         self.update_button.set_text("Downloading…")
-        self.update_thread = threading.Thread(target=self._download_update_worker, args=(self.update_info,), name="VelocityUpdateDownload", daemon=True)
+        self.update_thread = threading.Thread(target=self._download_update_worker, args=(self.update_info,), name="DragiWareUpdateDownload", daemon=True)
         self.update_thread.start()
 
     def _download_update_worker(self, release):
@@ -1852,51 +2126,145 @@ class BhopApp(tk.Tk):
         self.update_button.set_enabled(True)
         self.update_button.set_text("Install Update")
         self._log(f"Stable update v{self.update_info.version} downloaded and verified.")
+        self._show_update_install_dialog()
 
     def _update_action(self):
         if self.update_check_running:
             return
         if self.update_downloaded:
             if not getattr(sys, "frozen", False):
-                messagebox.showinfo("Packaged release required", "Updates can be installed from the packaged Velocity.exe release.", parent=self)
+                messagebox.showinfo("Packaged release required", "Updates can be installed from the packaged DragiWare.exe release.", parent=self)
                 self._log("Update install skipped while running from source.")
                 return
-            if messagebox.askyesno("Install Velocity update", "The verified stable update is ready. Restart Velocity and install it now?", parent=self, default="yes"):
-                try:
-                    self.updater.stage_and_install_on_exit(self.update_downloaded, self.shutdown)
-                except Exception as error:
-                    self.update_status_label.configure(text="●  Update failed — current installation is unchanged.", fg=self.DANGER)
-                    self._log(f"Stable update install failed: {error}")
+            self._show_update_install_dialog()
             return
         if self.update_info:
-            self._download_update()
+            self._show_update_available_dialog(self.update_info)
         else:
             self._check_for_updates()
+
+    def _show_update_available_dialog(self, release):
+        self._show_update_dialog(
+            eyebrow="BUILD UPDATED!",
+            title="A new version is available.",
+            detail=f"Version {release.version} is ready from the official release channel. Would you like to download it?",
+            confirm_text="Yes",
+            cancel_text="No",
+            on_confirm=self._download_update,
+            on_cancel=lambda: self._decline_update_download(release),
+        )
+
+    def _show_update_install_dialog(self):
+        self._show_update_dialog(
+            eyebrow="DOWNLOAD VERIFIED",
+            title="Install the update now?",
+            detail="DragiWare will close, replace its packaged executable, and restart only if you confirm.",
+            confirm_text="Yes",
+            cancel_text="No",
+            on_confirm=self._install_downloaded_update,
+            on_cancel=lambda: self._log("Verified update kept for manual installation later."),
+        )
+
+    def _show_update_dialog(self, eyebrow, title, detail, confirm_text, cancel_text, on_confirm, on_cancel):
+        if self.update_dialog and self.update_dialog.winfo_exists():
+            self.update_dialog.lift()
+            self.update_dialog.focus_force()
+            return
+
+        dialog = tk.Toplevel(self)
+        self.update_dialog = dialog
+        dialog.title("DragiWare update")
+        dialog.configure(bg=self.BG)
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.geometry("440x228")
+
+        panel = RoundedPanel(dialog, self.PANEL, height=228, radius=18, inset=22)
+        panel.pack(fill="both", expand=True, padx=1, pady=1)
+        tk.Label(panel.body, text=eyebrow, bg=self.PANEL, fg=self.RED, font=("Segoe UI Semibold", 8)).pack(anchor="w")
+        tk.Label(panel.body, text=title, bg=self.PANEL, fg=self.TEXT, font=("Segoe UI Semibold", 17)).pack(anchor="w", pady=(8, 0))
+        tk.Label(panel.body, text=detail, bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 9), justify="left", anchor="w", wraplength=385).pack(anchor="w", pady=(10, 0))
+        actions = tk.Frame(panel.body, bg=self.PANEL)
+        actions.pack(anchor="e", pady=(20, 0))
+
+        def dismiss(callback):
+            if dialog.winfo_exists():
+                dialog.grab_release()
+                dialog.destroy()
+            self.update_dialog = None
+            callback()
+
+        no_button = RoundedButton(actions, cancel_text, lambda: dismiss(on_cancel), self.BUTTON, self.TEXT, width=84, height=32)
+        no_button.pack(side="right")
+        yes_button = RoundedButton(actions, confirm_text, lambda: dismiss(on_confirm), self.RED, self.TEXT, width=84, height=32)
+        yes_button.pack(side="right", padx=(0, 8))
+        dialog.protocol("WM_DELETE_WINDOW", lambda: dismiss(on_cancel))
+        dialog.update_idletasks()
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - dialog.winfo_width()) // 2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height() - dialog.winfo_height()) // 2)
+        dialog.geometry(f"+{x}+{y}")
+        dialog.grab_set()
+        no_button.focus_set()
+
+    def _decline_update_download(self, release):
+        self.update_status_label.configure(text="●  Update available — download skipped", fg=self.MUTED)
+        self.update_button.set_text("Download Update")
+        self._log(f"Stable update v{release.version} was not downloaded.")
+
+    def _install_downloaded_update(self):
+        try:
+            self.updater.install_after_exit(self.update_downloaded, self.shutdown)
+        except Exception as error:
+            self.update_status_label.configure(text="●  Update failed — current installation is unchanged.", fg=self.DANGER)
+            self._log(f"Stable update install failed: {error}")
 
     def _toggle_auto_check(self):
         enabled = bool(self.auto_check_var.get())
         self.settings.update(auto_check_updates=enabled)
         self._log(f"Automatic stable update checks turned {'on' if enabled else 'off'}.")
 
-    def _toggle_auto_download(self):
-        enabled = bool(self.auto_download_var.get())
-        self.settings.update(auto_download_updates=enabled)
-        self._log(f"Automatic stable update downloads turned {'on' if enabled else 'off'}.")
-
     @staticmethod
-    def _key_name(key):
+    def _key_name(key, modifiers=0):
         common_names = {0x2D: "INSERT", 0x23: "END", 0x24: "HOME", 0x2E: "DELETE", 0x20: "SPACE"}
         if key in common_names:
-            return common_names[key]
-        if 0x70 <= key <= 0x87:
-            return f"F{key - 0x6F}"
-        if 0x30 <= key <= 0x39 or 0x41 <= key <= 0x5A:
-            return chr(key)
-        return f"KEY {key}"
+            name = common_names[key]
+        elif 0x70 <= key <= 0x87:
+            name = f"F{key - 0x6F}"
+        elif 0x30 <= key <= 0x39 or 0x41 <= key <= 0x5A:
+            name = chr(key)
+        else:
+            name = f"KEY {key}"
+        prefixes = []
+        if modifiers & MOD_CONTROL:
+            prefixes.append("CTRL")
+        if modifiers & MOD_ALT:
+            prefixes.append("ALT")
+        if modifiers & MOD_SHIFT:
+            prefixes.append("SHIFT")
+        if modifiers & MOD_WIN:
+            prefixes.append("WIN")
+        return "+".join(prefixes + [name])
+
+    @staticmethod
+    def _event_modifiers(event):
+        modifiers = 0
+        if event.state & 0x0004:
+            modifiers |= MOD_CONTROL
+        if event.state & 0x0008:
+            modifiers |= MOD_ALT
+        if event.state & 0x0001:
+            modifiers |= MOD_SHIFT
+        if event.state & 0x0040:
+            modifiers |= MOD_WIN
+        return modifiers
 
     def _begin_key_capture(self, setting):
         self.capturing_keybind = setting
-        button = self.toggle_change_button if setting == "toggle" else self.exit_change_button
+        button = {
+            "toggle": self.toggle_change_button,
+            "exit": self.exit_change_button,
+            "menu": self.menu_toggle_change_button,
+        }[setting]
         button.set_text("Press key")
         self.focus_force()
 
@@ -1904,25 +2272,39 @@ class BhopApp(tk.Tk):
         if not self.capturing_keybind:
             return
         setting = self.capturing_keybind
-        button = self.toggle_change_button if setting == "toggle" else self.exit_change_button
+        button = {
+            "toggle": self.toggle_change_button,
+            "exit": self.exit_change_button,
+            "menu": self.menu_toggle_change_button,
+        }[setting]
         if event.keysym == "Escape":
             button.set_text("Change")
             self.capturing_keybind = None
             return "break"
-        if event.keysym == "F5":
-            button.set_text("Change")
-            self.capturing_keybind = None
-            self._log("F5 is reserved for the Velocity menu and cannot be a BHOP keybind.")
+        if event.keysym in {"Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Win_L", "Win_R"}:
             return "break"
         key = event.keycode
         if not key:
             return "break"
+        modifiers = self._event_modifiers(event)
+        values = self.settings.snapshot()
+        if setting == "menu" and key in {values["toggle_key"], values["exit_key"]}:
+            self._log("Menu key conflicts with an existing BHOP or exit key.")
+            return "break"
+        if setting != "menu" and key == values["menu_toggle_key"]:
+            self._log("BHOP or exit key conflicts with the menu toggle key.")
+            return "break"
         if setting == "toggle":
             self.settings.update(toggle_key=key, preset="Custom")
             self._log(f"Toggle key changed to {self._key_name(key)}.")
-        else:
+        elif setting == "exit":
             self.settings.update(exit_key=key, preset="Custom")
             self._log(f"Exit key changed to {self._key_name(key)}.")
+        else:
+            self.settings.update(menu_toggle_key=key, menu_toggle_modifiers=modifiers, preset="Custom")
+            self.menu_toggle_key, self.menu_toggle_modifiers = key, modifiers
+            self._restart_menu_hotkey()
+            self._log(f"Menu toggle key changed to {self._key_name(key, modifiers)}.")
         self._sync_settings_to_ui()
         button.set_text("Change")
         self.capturing_keybind = None
@@ -1931,8 +2313,11 @@ class BhopApp(tk.Tk):
     def _sync_settings_to_ui(self):
         values = self.settings.snapshot()
         self.toggle_key, self.exit_key = values["toggle_key"], values["exit_key"]
+        self.menu_toggle_key, self.menu_toggle_modifiers = values["menu_toggle_key"], values["menu_toggle_modifiers"]
         self.toggle_key_label.configure(text=self._key_name(self.toggle_key))
         self.exit_key_label.configure(text=self._key_name(self.exit_key))
+        self.menu_toggle_key_label.configure(text=self._key_name(self.menu_toggle_key, self.menu_toggle_modifiers))
+        self.menu_hint.configure(text=f"{self._key_name(self.menu_toggle_key, self.menu_toggle_modifiers)}  /  MENU")
         self.toggle_hint.configure(text=f"Use {self._key_name(self.toggle_key)} to toggle instantly.")
         self._refresh_enabled(values["enabled"])
         self.debug_button.set_text("Debug: On" if values["debug_mode"] else "Debug: Off")
@@ -1942,8 +2327,6 @@ class BhopApp(tk.Tk):
             self.theme_var.set(self.theme_name)
         if hasattr(self, "auto_check_var"):
             self.auto_check_var.set(values.get("auto_check_updates", True))
-        if hasattr(self, "auto_download_var"):
-            self.auto_download_var.set(values.get("auto_download_updates", True))
 
     def _apply_preset(self, name):
         if name == "Custom":
@@ -1969,12 +2352,42 @@ class BhopApp(tk.Tk):
         self._rebuild_for_theme()
         self._log("Settings reset to defaults.")
 
+    def _copy_activity_log(self):
+        content = self.log.get("1.0", "end-1c")
+        self.clipboard_clear()
+        self.clipboard_append(content)
+        self._log("[CONSOLE] Diagnostics copied to the clipboard.")
+
+    def _clear_activity_log(self):
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
+        self._activity_line_count = 0
+        self.activity_log_status.configure(text="0 EVENTS  •  SAVED")
+        self._log("[CONSOLE] Live view cleared; the session log was retained.")
+
+    def _log_style(self, message):
+        upper = str(message).upper()
+        if "[FATAL]" in upper or "[TRACE]" in upper or "[ACTION]" in upper or "[LIVENESS]" in upper or "ERROR" in upper:
+            return "error"
+        if "[FOCUS]" in upper or "[ATTACH]" in upper or "[MODULE]" in upper:
+            return "success"
+        if "[IDLE]" in upper or "WAITING" in upper or "SKIPPED" in upper:
+            return "warning"
+        return "info"
+
     def _log(self, message):
         line = f"[{time.strftime('%H:%M:%S')}]  {message}"
         self.log.configure(state="normal")
-        self.log.insert("end", f"{line}\n")
+        self.log.insert("end", f"{line}\n", self._log_style(message))
+        self._activity_line_count += 1
+        while self._activity_line_count > 600:
+            self.log.delete("1.0", "2.0")
+            self._activity_line_count -= 1
         self.log.see("end")
         self.log.configure(state="disabled")
+        if hasattr(self, "activity_log_status"):
+            self.activity_log_status.configure(text=f"{self._activity_line_count} EVENTS  •  SAVED")
         try:
             with self.session_log.open("a", encoding="utf-8") as log_file:
                 log_file.write(f"{line}\n")
@@ -2096,6 +2509,7 @@ class BhopApp(tk.Tk):
 
 
 if __name__ == "__main__":
+    crash_reporter = install_crash_reporter(APP_NAME, APP_VERSION)
     ctypes.set_last_error(0)
     instance_mutex = kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX)
     if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
@@ -2103,7 +2517,7 @@ if __name__ == "__main__":
             kernel32.CloseHandle(instance_mutex)
 
         already_open = tk.Tk()
-        already_open.title("Bhop Script")
+        already_open.title("DragiWare")
         already_open.configure(bg=BhopApp.BG)
         already_open.resizable(False, False)
         width, height = 390, 190
@@ -2113,10 +2527,12 @@ if __name__ == "__main__":
         card = RoundedPanel(already_open, BhopApp.PANEL, height=150, radius=24)
         card.pack(fill="both", expand=True, padx=14, pady=14)
         tk.Label(card.body, text="Software already open", bg=BhopApp.PANEL, fg=BhopApp.TEXT, font=("Segoe UI Semibold", 16)).pack(anchor="w", pady=(5, 4))
-        tk.Label(card.body, text="Bhop Script is already running on this PC.", bg=BhopApp.PANEL, fg=BhopApp.MUTED, font=("Segoe UI", 10)).pack(anchor="w")
+        tk.Label(card.body, text="DragiWare is already running on this PC.", bg=BhopApp.PANEL, fg=BhopApp.MUTED, font=("Segoe UI", 10)).pack(anchor="w")
         RoundedButton(card.body, "Okay", already_open.destroy, BhopApp.BLUE, "#ffffff", width=88).pack(anchor="e", pady=(13, 0))
         already_open.mainloop()
     else:
-        BhopApp().mainloop()
+        app = BhopApp()
+        app.report_callback_exception = crash_reporter.report_tk_exception
+        app.mainloop()
         if instance_mutex:
             kernel32.CloseHandle(instance_mutex)

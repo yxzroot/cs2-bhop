@@ -1,4 +1,4 @@
-"""Centralized visual palettes for the native Velocity interface."""
+"""Centralized visual palettes for the native DragiWare interface."""
 
 from __future__ import annotations
 
@@ -660,6 +660,80 @@ THEMES = {
         "tooltip_text": "#F8FAFF",
     },
 }
+
+
+def _new_theme(bg, sidebar, panel, alt, text, muted, subtle, line, accent, accent_soft,
+                accent_hover, blue, green, warning, danger, button, button_hover,
+                input_color, logo_bg, logo_primary, logo_secondary, logo_accent,
+                tooltip_bg, tooltip_text):
+    return {
+        "bg": bg, "sidebar": sidebar, "panel": panel, "alt": alt, "text": text,
+        "muted": muted, "subtle": subtle, "line": line, "accent": accent,
+        "accent_soft": accent_soft, "accent_hover": accent_hover, "blue": blue,
+        "green": green, "warning": warning, "danger": danger, "button": button,
+        "button_hover": button_hover, "input": input_color, "logo_bg": logo_bg,
+        "logo_primary": logo_primary, "logo_secondary": logo_secondary,
+        "logo_accent": logo_accent, "tooltip_bg": tooltip_bg,
+        "tooltip_text": tooltip_text,
+    }
+
+
+THEMES.update({
+    "Cyber Void": _new_theme(
+        "#07050D", "#0D0917", "#151027", "#20163A", "#F4EEFF", "#A89CBD",
+        "#706582", "#332653", "#B56CFF", "#2B1748", "#D397FF", "#6F9DFF",
+        "#7AE6C1", "#E5BA73", "#FF6689", "#24183D", "#38245A", "#1C1230",
+        "#120B22", "#B56CFF", "#F4EEFF", "#6F9DFF", "#0B0714", "#F4EEFF",
+    ),
+    "Aurora": _new_theme(
+        "#07131A", "#0B1D26", "#102A32", "#164047", "#EDFFFB", "#8CB9B7",
+        "#5F898C", "#23545A", "#64E2C0", "#123F44", "#91F5D8", "#76C7FF",
+        "#8BEA9A", "#E9C26F", "#FF7896", "#173B42", "#24565B", "#14343D",
+        "#0D2630", "#64E2C0", "#EDFFFB", "#A878FF", "#071B21", "#EDFFFB",
+    ),
+    "Cherry Bomb": _new_theme(
+        "#16070F", "#230A16", "#35101F", "#4A1729", "#FFF0F5", "#C18A9B",
+        "#8D586B", "#64263C", "#FF3F68", "#541329", "#FF7190", "#D94B78",
+        "#9ED5B5", "#F0B46E", "#FF3F68", "#5B1B31", "#7B2845", "#451226",
+        "#2D0D1A", "#FF3F68", "#FFF0F5", "#FF9CBA", "#1B0912", "#FFF0F5",
+    ),
+    "Y2K": _new_theme(
+        "#10141B", "#171D26", "#252E3A", "#374352", "#F3F6FA", "#AAB5C2",
+        "#7B8796", "#566575", "#F06BC6", "#4B294C", "#FF8BD9", "#38D9F2",
+        "#61D1B6", "#E2B866", "#FF6D8E", "#354352", "#46576A", "#1D2631",
+        "#252E3A", "#F06BC6", "#F3F6FA", "#38D9F2", "#151C25", "#FFFFFF",
+    ),
+    "Glitch": _new_theme(
+        "#080A0E", "#0E1118", "#151A22", "#202832", "#F2F7FF", "#93A0B2",
+        "#647080", "#2D3948", "#FF3E55", "#401A28", "#FF697A", "#23E1E8",
+        "#73D6A0", "#F2C66D", "#FF3E55", "#252D38", "#354250", "#1B232D",
+        "#10161F", "#FF3E55", "#F2F7FF", "#23E1E8", "#091016", "#F2F7FF",
+    ),
+    "Lavender": _new_theme(
+        "#110D19", "#191326", "#251C38", "#34274B", "#FBF5FF", "#B8A9C9",
+        "#7F6F93", "#49385E", "#B99AFF", "#39265B", "#D0B9FF", "#8C9CFF",
+        "#A4D8BE", "#E8C27A", "#EF719F", "#3A2C50", "#51406D", "#302340",
+        "#211731", "#B99AFF", "#FBF5FF", "#D7B7FF", "#160F23", "#FBF5FF",
+    ),
+    "Terminal": _new_theme(
+        "#0B0F0D", "#101713", "#17221B", "#203027", "#E7F7E9", "#91A995",
+        "#617765", "#30483A", "#79D98B", "#173B25", "#9BF0A9", "#8BC7B0",
+        "#79D98B", "#E6BF70", "#E96C74", "#263A2D", "#36513C", "#1D2D23",
+        "#132019", "#79D98B", "#E7F7E9", "#B4E39B", "#0B1510", "#E7F7E9",
+    ),
+    "Blood Moon": _new_theme(
+        "#090507", "#14080B", "#241015", "#36151C", "#FFF1F0", "#B18B8D",
+        "#795D62", "#51242B", "#FF5A3D", "#50151D", "#FF8068", "#C65A69",
+        "#A9D0A9", "#FFB35E", "#FF5A3D", "#431922", "#672632", "#2E1219",
+        "#1D0B10", "#FF5A3D", "#FFF1F0", "#B91F3F", "#100609", "#FFF1F0",
+    ),
+    "Cotton Candy": _new_theme(
+        "#100D18", "#181329", "#241C3B", "#35274F", "#FFF3FC", "#BCA5C3",
+        "#836D8F", "#4B3860", "#FF83C8", "#512855", "#FFABE0", "#54DCEB",
+        "#A9D89D", "#E8BE7B", "#F26C9F", "#3A2D55", "#56416F", "#302443",
+        "#211730", "#FF83C8", "#FFF3FC", "#7AE8F0", "#150C20", "#FFF3FC",
+    ),
+})
 
 
 THEME_NAMES = tuple(THEMES)
